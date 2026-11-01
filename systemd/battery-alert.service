@@ -1,0 +1,17 @@
+[Unit]
+Description=Low battery warnings (sticky notification plus sound)
+Documentation=https://github.com/egoexpress/cosmic-battery-warning
+ConditionPathExistsGlob=/sys/class/power_supply/BAT*
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/battery-alert
+Environment=POLL=15
+Environment=REPEAT=300
+Restart=always
+RestartSec=15
+
+[Install]
+WantedBy=graphical-session.target

@@ -1,0 +1,270 @@
+#!/usr/bin/env bash
+# battery-alert - escalating, hard-to-miss low-battery warnings for COSMIC.
+#
+# Usage:
+#   battery-alert              watch continuously (what battery-alert.service runs)
+#   battery-alert --test 10    show the 10 % warning once, then exit
+#   battery-alert --status     print the values the script reads
+#   battery-alert --help
+#   battery-alert --version
+#
+# Everything is tuned with environment variables, all optional:
+#   BAT            battery name (default: first BAT* in /sys/class/power_supply)
+#   POLL           seconds between samples (default 15)
+#   STAGES         warning thresholds in percent (default "20 10 5 2")
+#   REPEAT         once at or below 5 %, re-show the sticky warning every this
+#                  many seconds (default 300, 0 = never)
+#   SOUND          1 = play the COSMIC battery sounds (default 1)
+#   OSD_SHUTDOWN   1 = at the last stage also show cosmic-osd's fullscreen
+#                  "shutting down in N seconds" countdown (default 0). It can
+#                  be cancelled on screen, but it does shut the machine down.
+#   DRY_RUN        1 = print notifications instead of sending them (for tests)
+#   SYSFS          power supply directory (default /sys/class/power_supply)
+
+set -uo pipefail
+
+VERSION="1.0.0"
+APP="Battery"
+SOUND_DIR="/usr/share/sounds/COSMIC/stereo"
+
+BAT="${BAT:-}"
+POLL="${POLL:-15}"
+STAGES="${STAGES:-20 10 5 2}"
+REPEAT="${REPEAT:-300}"
+SOUND="${SOUND:-1}"
+OSD_SHUTDOWN="${OSD_SHUTDOWN:-0}"
+DRY_RUN="${DRY_RUN:-0}"
+SYSFS="${SYSFS:-/sys/class/power_supply}"
+
+state_ac=0        # 1 while on mains
+announced=0       # lowest threshold already announced in this discharge
+last_shown=0      # timestamp of the last notification
+notif_id=""       # id of the sticky notification, so it can be replaced/closed
+pct=0
+eta=0
+
+die() { printf '%s: %s\n' "$APP" "$*" >&2; exit 1; }
+
+usage() {
+    # print the comment block at the top of this file, without the shebang
+    awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"
+}
+
+# ---------------------------------------------------------------- sysfs reads
+
+find_battery() {
+    [[ -n $BAT ]] && { printf '%s' "$BAT"; return; }
+    local b
+    for b in "$SYSFS"/BAT*; do
+        [[ -e $b ]] && { printf '%s' "${b##*/}"; return; }
+    done
+    return 1
+}
+
+battery_dir() { printf '%s/%s' "$SYSFS" "$BAT"; }
+
+read_sample() {
+    local d
+    d=$(battery_dir)
+    [[ -r $d/capacity ]] || die "cannot read $d/capacity"
+
+    pct=$(<"$d/capacity")
+    [[ $pct =~ ^[0-9]+$ ]] || die "unexpected capacity '$pct' in $d/capacity"
+
+    # mains: any supply of type Mains that is online
+    state_ac=0
+    local p
+    for p in "$SYSFS"/*; do
+        [[ -r $p/type ]] || continue
+        [[ $(<"$p/type") == Mains ]] || continue
+        [[ $(<"$p/online") == 1 ]] && state_ac=1
+    done
+
+    # remaining run time from energy/power (both in µWh resp. µW)
+    eta=0
+    local e=0 pow=0
+    [[ -r $d/energy_now ]] && e=$(<"$d/energy_now")
+    [[ -r $d/power_now ]] && pow=$(<"$d/power_now")
+    if [[ $e =~ ^[0-9]+$ && $pow =~ ^[0-9]+$ ]] && (( pow > 0 )); then
+        eta=$(( e * 3600 / pow ))
+    fi
+}
+
+is_discharging() {
+    local st=""
+    [[ -r $(battery_dir)/status ]] && st=$(<"$(battery_dir)/status")
+    (( state_ac == 0 )) && [[ $st == Discharging ]]
+}
+
+fmt_eta() {
+    local s=${1:-0} h m
+    (( s > 0 )) || { printf 'unknown'; return; }
+    h=$(( s / 3600 )); m=$(( (s % 3600) / 60 ))
+    if (( h > 0 )); then printf '%dh %02d min' "$h" "$m"; else printf '%d min' "$m"; fi
+}
+
+# ------------------------------------------------------------------ plumbing
+
+play_sound() {
+    (( SOUND )) || return 0
+    (( DRY_RUN )) && return 0
+    local f
+    for f in "$@"; do
+        [[ -f $f ]] || continue
+        pw-play --volume=0.9 "$f" >/dev/null 2>&1 && return 0
+        paplay "$f" >/dev/null 2>&1 && return 0
+    done
+    return 1
+}
+
+beep() { # beep <count> <file>...
+    local n=$1 i
+    shift
+    for (( i = 0; i < n; i++ )); do
+        play_sound "$@"
+        (( i + 1 < n )) && sleep 0.45
+    done
+}
+
+notify() { # notify <urgency> <timeout-ms> <icon> <title> <body>
+    local urgency=$1 ttl=$2 icon=$3 title=$4 body=$5
+    if (( DRY_RUN )); then
+        printf 'DRY_RUN notify %s %s: %s | %s\n' "$urgency" "$ttl" "$title" "$body"
+        notif_id="dry"
+        return 0
+    fi
+    local -a args=(-a "$APP" -i "$icon" -u "$urgency" -t "$ttl" -c device)
+    [[ -n $notif_id ]] && args+=(-r "$notif_id")
+    notif_id=$(notify-send -p "${args[@]}" "$title" "$body" 2>/dev/null)
+    [[ -n $notif_id ]] || printf '%s: notification failed\n' "$APP" >&2
+}
+
+close_notification() {
+    [[ -n $notif_id ]] || return 0
+    if (( ! DRY_RUN )); then
+        gdbus call --session --dest org.freedesktop.Notifications \
+            --object-path /org/freedesktop/Notifications \
+            --method org.freedesktop.Notifications.CloseNotification "$notif_id" \
+            >/dev/null 2>&1
+    fi
+    notif_id=""
+}
+
+# ------------------------------------------------------------------ messages
+
+announce() { # announce <stage>
+    local stage=$1 left
+    left=$(fmt_eta "$eta")
+
+    case $stage in
+        20)
+            notify critical 20000 battery-level-20-symbolic \
+                "Battery low - $pct% left" \
+                "About $left of runtime. The charger is not plugged in."
+            beep 1 "$SOUND_DIR/notification/battery-caution.oga"
+            ;;
+        10)
+            notify critical 0 battery-caution-symbolic \
+                "Battery low - $pct% left" \
+                "About $left of runtime. Plug in the charger now."
+            beep 1 "$SOUND_DIR/alert/battery-low.oga"
+            ;;
+        5)
+            notify critical 0 battery-caution-symbolic \
+                "Battery critical - $pct% left" \
+                "About $left of runtime. Plug in or hibernate now."
+            beep 2 "$SOUND_DIR/alert/battery-low.oga"
+            ;;
+        *)
+            notify critical 0 battery-level-0-symbolic \
+                "Battery almost empty - $pct%" \
+                "Plug in immediately. About $left of runtime left before the machine hibernates."
+            beep 3 "$SOUND_DIR/alert/battery-low.oga" "$SOUND_DIR/alert/alarm-clock-elapsed.oga"
+            if (( OSD_SHUTDOWN )); then
+                (( DRY_RUN )) || cosmic-osd shutdown >/dev/null 2>&1 &
+            fi
+            ;;
+    esac
+}
+
+# the tightest threshold the current charge has reached (empty if none)
+stage_for() {
+    local s out=""
+    for s in $STAGES; do
+        (( pct <= s )) && out=$s
+    done
+    printf '%s' "$out"
+}
+
+# ---------------------------------------------------------------------- modes
+
+test_mode() {
+    local stage=${1:-10}
+    read_sample
+    (( eta > 0 )) || eta=$(( pct * 60 * 15 ))
+    printf '%s: showing the %s %% warning (battery now %s %%, on mains: %s)\n' \
+        "$APP" "$stage" "$pct" "$state_ac"
+    announce "$stage"
+    printf '%s: notification id %s\n' "$APP" "${notif_id:-none (already dismissed?)}"
+}
+
+status_mode() {
+    read_sample
+    printf 'battery:      %s\n' "$BAT"
+    printf 'charge:       %s %%\n' "$pct"
+    printf 'status:       %s\n' "$(<"$(battery_dir)/status")"
+    printf 'on mains:     %s\n' "$state_ac"
+    printf 'remaining:    %s\n' "$(fmt_eta "$eta")"
+    printf 'stage now:    %s\n' "$(stage_for)"
+    printf 'stages:       %s\n' "$STAGES"
+}
+
+watch_mode() {
+    local stage now
+    printf '%s: watching %s, stages [%s], poll %ss\n' "$APP" "$BAT" "$STAGES" "$POLL"
+    while :; do
+        read_sample
+        now=$(date +%s)
+
+        if ! is_discharging; then
+            if (( announced )); then
+                printf '%s: back on power at %s%%, clearing warnings\n' "$APP" "$pct"
+                close_notification
+                announced=0
+            fi
+            sleep "$POLL"
+            continue
+        fi
+
+        stage=$(stage_for)
+        if [[ -n $stage ]]; then
+            if (( stage < announced || announced == 0 )); then
+                announce "$stage"
+                announced=$stage
+                last_shown=$now
+                printf '%s: %s%% -> stage %s%% announced\n' "$APP" "$pct" "$stage"
+            elif (( announced <= 5 && REPEAT > 0 && now - last_shown >= REPEAT )); then
+                announce "$stage"
+                last_shown=$now
+                printf '%s: %s%% -> stage %s%% repeated\n' "$APP" "$pct" "$stage"
+            fi
+        fi
+
+        sleep "$POLL"
+    done
+}
+
+# ---------------------------------------------------------------------- main
+
+command -v notify-send >/dev/null 2>&1 || (( DRY_RUN )) || die "notify-send not found (package libnotify)"
+
+BAT=$(find_battery) || die "no battery found in $SYSFS"
+
+case ${1:-} in
+    --test)    test_mode "${2:-10}" ;;
+    --status)  status_mode ;;
+    --version|-V) printf '%s %s\n' "${0##*/}" "$VERSION" ;;
+    --help|-h) usage ;;
+    ""|--watch) watch_mode ;;
+    *) die "unknown argument: $1 (try --help)" ;;
+esac
